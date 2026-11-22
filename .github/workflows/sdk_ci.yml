@@ -1,0 +1,137 @@
+# Format, analyze and test on every PR and push to main, on the declared minimum Dart
+# (pubspec.yaml: sdk ^3.4.0, with the lowest allowed package:http) and on the latest
+# stable; check the package archive; and build a consumer outside the checkout.
+name: SDK CI
+
+on:
+  # Started by dependabot-auto-merge.yml after it merges: a merge made with GITHUB_TOKEN
+  # starts no push workflows.
+  workflow_dispatch:
+  pull_request:
+    types: [opened, synchronize, reopened]
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+# A newer push to a pull request replaces the run in progress; runs on main finish.
+concurrency:
+  group: sdk-ci-${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  test:
+    name: Test (Dart ${{ matrix.sdk }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        # 3.4.0 is the floor in pubspec.yaml; stable is the newest release.
+        sdk: ["3.4.0", "stable"]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Set up Dart
+        uses: dart-lang/setup-dart@2286a0c042b44434fe26d292bbce8d34f7ec662b # v1.8.2
+        with:
+          sdk: ${{ matrix.sdk }}
+
+      - name: Install dependencies
+        run: dart pub get
+
+      # The floor lane also proves the lowest package:http that pubspec.yaml allows.
+      - name: Use the lowest allowed package:http
+        if: matrix.sdk == '3.4.0'
+        run: dart pub downgrade http
+
+      - name: Check formatting
+        if: matrix.sdk == 'stable'
+        run: dart format --output=none --set-exit-if-changed .
+
+      - name: Analyze
+        run: dart analyze --fatal-infos
+
+      - name: Test (offline)
+        run: dart test
+
+      # The archive pub.dev would receive: no warnings, and none of the files that stay
+      # out of the package (.pubignore).
+      - name: Check the package archive
+        if: matrix.sdk == 'stable'
+        run: |
+          set -eu
+          dart pub publish --dry-run
+          dart pub publish --to-archive="$RUNNER_TEMP/package.tar.gz"
+          tar -tzf "$RUNNER_TEMP/package.tar.gz" | sort | tee "$RUNNER_TEMP/files.txt"
+          grep -qx 'lib/zerobounce_sdk.dart' "$RUNNER_TEMP/files.txt"
+          if grep -E '^(test|tool|\.github|\.dart_tool)/|(^|/)\.env|pubspec\.lock|^AGENTS\.md$' "$RUNNER_TEMP/files.txt"; then
+            echo "::error::The package archive contains a file that must stay out of it."
+            exit 1
+          fi
+
+  # The package used the way a consumer uses it: a path dependency from a project outside
+  # the checkout, compiled to a native executable (run offline) and to JavaScript (the web
+  # build must not reach dart:io).
+  consumer:
+    name: Consumer (Dart ${{ matrix.sdk }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        sdk: ["3.4.0", "stable"]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Set up Dart
+        uses: dart-lang/setup-dart@2286a0c042b44434fe26d292bbce8d34f7ec662b # v1.8.2
+        with:
+          sdk: ${{ matrix.sdk }}
+
+      - name: Build and run a consumer
+        run: |
+          set -eu
+          mkdir -p "$RUNNER_TEMP/consumer/bin"
+          cd "$RUNNER_TEMP/consumer"
+          cat > pubspec.yaml <<EOF
+          name: consumer
+          publish_to: none
+          environment:
+            sdk: ^3.4.0
+          dependencies:
+            zerobounce_sdk:
+              path: $GITHUB_WORKSPACE
+          EOF
+          cat > bin/consumer.dart <<'EOF'
+          import 'package:zerobounce_sdk/zerobounce_sdk.dart';
+
+          Future<void> main() async {
+            try {
+              ZeroBounceSDK('key', baseUrl: 'http://api.zerobounce.net/v2');
+              throw StateError('an http base URL was accepted');
+            } on ZBException catch (error) {
+              if (error.statusCode != 0) throw StateError('unexpected status');
+            }
+            // Port 9 on loopback refuses the connection: a transport error, status 0.
+            final zb = ZeroBounceSDK('key', baseUrl: 'http://127.0.0.1:9/v2');
+            try {
+              await zb.getCredits();
+              throw StateError('a refused connection succeeded');
+            } on ZBException catch (error) {
+              if (error.statusCode != 0) throw StateError('unexpected status');
+              print('ok: ${error.message}');
+            } finally {
+              zb.close();
+            }
+          }
+          EOF
+          dart pub get
+          dart compile exe bin/consumer.dart -o consumer
+          ./consumer
+          dart compile js bin/consumer.dart -o consumer.js

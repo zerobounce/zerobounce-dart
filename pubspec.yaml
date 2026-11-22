@@ -1,0 +1,25 @@
+name: zerobounce_sdk
+description: >-
+  Official ZeroBounce Dart SDK: email validation, AI scoring, bulk files, email
+  finder and domain search. Pure Dart; works on Flutter, the server and the web.
+version: 1.0.0
+homepage: https://www.zerobounce.net
+repository: https://github.com/zerobounce/zerobounce-dart
+issue_tracker: https://github.com/zerobounce/zerobounce-dart/issues
+documentation: https://www.zerobounce.net/docs/
+topics:
+  - email
+  - email-validation
+  - email-verification
+  - zerobounce
+  - api
+
+environment:
+  sdk: ^3.4.0
+
+dependencies:
+  http: ^1.5.0
+
+dev_dependencies:
+  lints: ">=4.0.0 <7.0.0"
+  test: ^1.25.0

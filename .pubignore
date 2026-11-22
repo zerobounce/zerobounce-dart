@@ -1,0 +1,26 @@
+# pub reads this file instead of .gitignore when publishing, so it repeats
+# every entry of .gitignore. The published package holds lib/, example/, the
+# README, CHANGELOG, LICENSE and pubspec.yaml: no tests, fixtures, CI files or
+# secrets.
+.dart_tool/
+.packages
+build/
+pubspec.lock
+doc/api/
+coverage/
+.env
+.env.*
+.idea/
+.vscode/
+*.iml
+*.swp
+.DS_Store
+Thumbs.db
+
+.github/
+test/
+tool/
+AGENTS.md
+CONTRIBUTING.md
+CODE_OF_CONDUCT.md
+SECURITY.md

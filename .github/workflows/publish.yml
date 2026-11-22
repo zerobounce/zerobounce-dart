@@ -1,0 +1,239 @@
+name: Publish
+
+# Unlike the other ZeroBounce SDKs (workflow_dispatch with a tag input), this workflow
+# starts when a release tag is pushed: pub.dev's GitHub Actions publishing only accepts
+# an OIDC token from a workflow run started by pushing a tag that matches the pattern set
+# on pub.dev (v{{version}}). Pushing the tag is therefore the request to publish; the
+# publish job still waits for a reviewer in the `release` environment.
+#
+# One-time setup on pub.dev (package admin page, after the first manual upload):
+# Automated publishing > GitHub Actions: repository zerobounce/zerobounce-dart, tag
+# pattern v{{version}}, required environment `release`. The `release` environment in
+# this repository must allow deployments from tags matching v*.*.* (not only main).
+on:
+  push:
+    tags:
+      - "v[0-9]+.[0-9]+.[0-9]+"
+
+permissions:
+  contents: read
+
+# One publish per tag at a time; a second run waits instead of cancelling a release half way.
+concurrency:
+  group: publish-${{ github.ref_name }}
+  cancel-in-progress: false
+
+env:
+  # The Dart that builds, tests and uploads the release (the latest stable when pinned).
+  DART_SDK: "3.14.1"
+
+jobs:
+  validate-tag:
+    name: Validate tag
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    outputs:
+      tag_sha: ${{ steps.tag_sha.outputs.sha }}
+    steps:
+      - name: Validate the tag name
+        env:
+          TAG: ${{ github.ref_name }}
+        run: |
+          if [[ ! "$TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "Error: '$TAG' is not a release tag such as v1.2.3."
+            exit 1
+          fi
+
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          ref: ${{ github.ref }}
+          persist-credentials: false
+
+      - name: Record tag commit SHA
+        id: tag_sha
+        env:
+          TAG: ${{ github.ref_name }}
+        run: |
+          SHA=$(git rev-parse "refs/tags/$TAG^{commit}")
+          echo "sha=$SHA" >> "$GITHUB_OUTPUT"
+
+      - name: Verify the tagged commit is on main
+        env:
+          SHA: ${{ steps.tag_sha.outputs.sha }}
+        run: |
+          if ! git merge-base --is-ancestor "$SHA" origin/main; then
+            echo "Error: the tagged commit $SHA is not on main. Release from main only."
+            exit 1
+          fi
+
+      - name: Verify pubspec.yaml and CHANGELOG.md match the tag
+        env:
+          TAG: ${{ github.ref_name }}
+        run: |
+          VERSION="${TAG#v}"
+          PUBSPEC_VERSION=$(sed -n 's/^version:[[:space:]]*\([^[:space:]#]*\).*/\1/p' pubspec.yaml)
+          if [ "$PUBSPEC_VERSION" != "$VERSION" ]; then
+            echo "Error: pubspec.yaml version ($PUBSPEC_VERSION) does not match the tag ($TAG)."
+            exit 1
+          fi
+          if ! grep -qE "^## \[${VERSION//./\\.}\] - [0-9]{4}-[0-9]{2}-[0-9]{2}$" CHANGELOG.md; then
+            echo "Error: CHANGELOG.md has no '## [$VERSION] - YYYY-MM-DD' section."
+            exit 1
+          fi
+
+  test:
+    name: Test and build the package archive
+    needs: [validate-tag]
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Checkout tag
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.ref }}
+          persist-credentials: false
+
+      - name: Verify checkout matches validated SHA
+        env:
+          TAG_SHA: ${{ needs.validate-tag.outputs.tag_sha }}
+        run: |
+          HEAD_SHA=$(git rev-parse HEAD)
+          if [ -z "$TAG_SHA" ] || [ "$HEAD_SHA" != "$TAG_SHA" ]; then
+            echo "Error: checked-out commit ($HEAD_SHA) does not match the validated tag commit ($TAG_SHA)."
+            exit 1
+          fi
+
+      - name: Set up Dart
+        uses: dart-lang/setup-dart@2286a0c042b44434fe26d292bbce8d34f7ec662b # v1.8.2
+        with:
+          sdk: ${{ env.DART_SDK }}
+
+      - name: Install dependencies
+        run: dart pub get
+
+      - name: Check formatting
+        run: dart format --output=none --set-exit-if-changed .
+
+      - name: Analyze
+        run: dart analyze --fatal-infos
+
+      - name: Test (offline)
+        run: dart test
+
+      - name: Validate the package
+        run: dart pub publish --dry-run
+
+      # The archive the publish job uploads, unchanged.
+      - name: Build the package archive
+        run: dart pub publish --to-archive="$RUNNER_TEMP/package.tar.gz"
+
+      - name: Check the archive contents
+        run: |
+          set -eu
+          tar -tzf "$RUNNER_TEMP/package.tar.gz" | sort | tee "$RUNNER_TEMP/files.txt"
+          grep -qx 'pubspec.yaml' "$RUNNER_TEMP/files.txt"
+          grep -qx 'lib/zerobounce_sdk.dart' "$RUNNER_TEMP/files.txt"
+          if grep -E '^(test|tool|\.github|\.dart_tool)/|(^|/)\.env|pubspec\.lock' "$RUNNER_TEMP/files.txt"; then
+            echo "Error: the archive contains a file that must stay out of the package."
+            exit 1
+          fi
+
+      - name: Upload the tested archive
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: package-archive
+          path: ${{ runner.temp }}/package.tar.gz
+          if-no-files-found: error
+          retention-days: 7
+          overwrite: true
+
+  publish:
+    name: Publish to pub.dev
+    needs: [validate-tag, test]
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    environment: release
+    permissions:
+      contents: read
+      id-token: write # pub.dev trusted publishing (OIDC); no token is stored anywhere
+    steps:
+      # No checkout and no build: what is published is the archive the test job built and tested.
+      - name: Download the tested archive
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: package-archive
+          path: ${{ runner.temp }}/archive
+
+      - name: Verify the archive is the tag's version
+        env:
+          TAG: ${{ github.ref_name }}
+        run: |
+          set -eu
+          FILE="$RUNNER_TEMP/archive/package.tar.gz"
+          NAME=$(tar -xzOf "$FILE" pubspec.yaml | sed -n 's/^name:[[:space:]]*\([^[:space:]#]*\).*/\1/p')
+          VERSION=$(tar -xzOf "$FILE" pubspec.yaml | sed -n 's/^version:[[:space:]]*\([^[:space:]#]*\).*/\1/p')
+          if [ "$NAME" != "zerobounce_sdk" ] || [ "$VERSION" != "${TAG#v}" ]; then
+            echo "Error: the archive is $NAME $VERSION, not zerobounce_sdk ${TAG#v}."
+            exit 1
+          fi
+          sha256sum "$FILE"
+
+      # A version pub.dev already has (1.0.0 was uploaded by hand, or a re-run after the
+      # upload succeeded) is not uploaded again; the release job still runs.
+      - name: Check whether pub.dev already has this version
+        id: existing
+        env:
+          TAG: ${{ github.ref_name }}
+        run: |
+          set -eu
+          STATUS=$(curl -sS -o "$RUNNER_TEMP/pub.json" -w '%{http_code}' \
+            "https://pub.dev/api/packages/zerobounce_sdk/versions/${TAG#v}")
+          case "$STATUS" in
+            200) echo "published=true" >> "$GITHUB_OUTPUT"
+                 echo "::notice::pub.dev already has zerobounce_sdk ${TAG#v}; skipping the upload." ;;
+            404) echo "published=false" >> "$GITHUB_OUTPUT" ;;
+            *)   echo "Error: pub.dev answered HTTP $STATUS."; exit 1 ;;
+          esac
+
+      # setup-dart exchanges this job's OIDC token for a pub.dev token (id-token: write).
+      - name: Set up Dart
+        if: steps.existing.outputs.published == 'false'
+        uses: dart-lang/setup-dart@2286a0c042b44434fe26d292bbce8d34f7ec662b # v1.8.2
+        with:
+          sdk: ${{ env.DART_SDK }}
+
+      - name: Publish to pub.dev
+        if: steps.existing.outputs.published == 'false'
+        run: dart pub publish --from-archive="$RUNNER_TEMP/archive/package.tar.gz" --force
+
+  release:
+    name: Create GitHub Release
+    needs: [validate-tag, publish]
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    steps:
+      - name: Create release if missing
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ github.ref_name }}
+          TAG_SHA: ${{ needs.validate-tag.outputs.tag_sha }}
+        run: |
+          if [ -z "$TAG_SHA" ]; then
+            echo "Error: validated tag SHA is missing."
+            exit 1
+          fi
+          if gh release view "$TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            echo "Release $TAG already exists, skipping."
+          else
+            gh release create "$TAG" \
+              --repo "$GITHUB_REPOSITORY" \
+              --title "$TAG" \
+              --verify-tag \
+              --target "$TAG_SHA" \
+              --latest \
+              --generate-notes
+          fi
