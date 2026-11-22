@@ -4,7 +4,9 @@ All notable changes to this package are documented here. The format follows
 [Keep a Changelog 1.1.0](https://keepachangelog.com/en/1.1.0/), and the project
 adheres to [Semantic Versioning 2.0.0](https://semver.org/spec/v2.0.0.html).
 
-## [1.0.0] - Unreleased
+## [Unreleased]
+
+## [1.0.0] - 2026-11-22
 
 The first release of the ZeroBounce Dart SDK (`zerobounce_sdk` on pub.dev).
 Pure Dart on `package:http`: Flutter (mobile, desktop, web), the server and the
@@ -58,4 +60,5 @@ browser. Requires Dart 3.4 or later.
 - The key is redacted from every error in every spelling the SDK sends or a
   server can echo; a message whose decoded text still holds it is replaced.
 
+[Unreleased]: https://github.com/zerobounce/zerobounce-dart/compare/v1.0.0...HEAD
 [1.0.0]: https://github.com/zerobounce/zerobounce-dart/releases/tag/v1.0.0
